@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>STACK — Narrow Lane</title>
+<style>
+  :root{
+    --bg0:#0b0f16;
+    --bg1:#0e1116;
+    --ink:#e6eefc;
+
+    /* Accent palette (keep minimal for the “single-floppy” vibe) */
+    --good:#6fffc7;      /* PERFECT */
+    --nice:#7bd3ff;      /* NICE */
+    --close:#ffd36f;     /* CLOSE */
+    --counter:#c59bff;   /* COUNTER */
+    --warn:#ff6f8f;      /* HOLD / danger */
+  }
+  html,body{margin:0;height:100%;background:var(--bg1);overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+  .hud{
+    position:fixed;left:12px;right:12px;top:12px;
+    display:flex;justify-content:space-between;gap:10px;
+    font:13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    color:var(--ink); pointer-events:none; text-shadow:0 1px 0 #000;
+  }
+  .pill{border:1px solid #ffffff22;border-radius:999px;padding:6px 10px;background:#00000033}
+  .overlay{
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background:radial-gradient(1200px 700px at 50% 40%, #152040cc 0%, #0b0f16ee 60%, #05070bee 100%);
+    color:var(--ink);
+  }
+  .card{
+    width:min(560px, 92vw);
+    border:1px solid #ffffff22; border-radius:18px;
+    background:#00000055; backdrop-filter: blur(6px);
+    padding:18px 18px 14px 18px;
+  }
+  .title{font:800 22px system-ui; letter-spacing:0.4px; margin:0 0 8px 0}
+  .sub{opacity:0.85; margin:0 0 12px 0; font:14px system-ui}
+  .keys{display:grid; grid-template-columns: 1fr; gap:6px; font:13px system-ui; opacity:0.92}
+  .k{display:flex; justify-content:space-between; gap:12px; padding:8px 10px;
+     border:1px solid #ffffff16; border-radius:12px; background:#00000033}
+  .hint{margin-top:12px; font:12px system-ui; opacity:0.7}
+  .tiny{opacity:0.75}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="hud">
+  <div class="pill" id="hudL">RUN: 0 · BANK: 0</div>
+  <div class="pill" id="hudR">BEST RUN: 0 · BEST BANK: 0 · BEST HEIGHT: 0</div>
+</div>
+
+<!-- Onboarding (auto-hides after first input; press H to toggle later) -->
+<div class="overlay" id="ov" style="display:none">
+  <div class="card">
+    <div class="title">STACK — Narrow Lane</div>
+    <p class="sub">Catch falling blocks and build a tower. Counterbalance left/right to calm the wobble.</p>
+    <div class="keys">
+      <div class="k"><span><b>Mouse</b> move</span><span class="tiny">Slide base</span></div>
+      <div class="k"><span><b>A/D</b> or <b>←/→</b></span><span class="tiny">Nudge base</span></div>
+      <div class="k"><span><b>Space</b> / <b>Click</b></span><span class="tiny">Fast-drop (commit)</span></div>
+      <div class="k"><span><b>S</b></span><span class="tiny">Bank (cash out RUN)</span></div>
+      <div class="k"><span><b>R</b></span><span class="tiny">Reset</span></div>
+      <div class="k"><span><b>H</b></span><span class="tiny">Show/Hide help</span></div>
+    </div>
+    <div class="hint">Tip: if you place left, then right (or right, then left) with similar strength, you’ll get <span style="color:var(--counter);font-weight:800">COUNTER!</span> and the tower relaxes.</div>
+    <div class="hint tiny">Press any key or click to start.</div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ============================================================
+  // STACK — Narrow Lane (Single HTML “floppy demo”)
+  // Core tuning you requested (kept):
+  //   GRAV = 1500
+  //   OFF_CLAMP = 0.48
+  //   SNAP = 0.35
+  //   LANE_W = 0.30
+  // Plus: Counterbalance Bonus, anti-cheap spawns, risk readability,
+  //       and a collapse grace window for mobile fairness.
+  // Added now: Onboarding overlay + Best score/height (localStorage).
+  // ============================================================
+
+  const c = document.getElementById('c');
+  const ctx = c.getContext('2d', { alpha:false });
+  const hudL = document.getElementById('hudL');
+  const hudR = document.getElementById('hudR');
+  const ov = document.getElementById('ov');
+
+  // CSS color vars (read once; safe fallback)
+  const css = getComputedStyle(document.documentElement);
+  const INK = css.getPropertyValue('--ink').trim() || '#e6eefc';
+  const GOOD = css.getPropertyValue('--good').trim() || '#6fffc7';
+  const NICE = css.getPropertyValue('--nice').trim() || '#7bd3ff';
+  const CLOSE = css.getPropertyValue('--close').trim() || '#ffd36f';
+  const COUNTER = css.getPropertyValue('--counter').trim() || '#c59bff';
+  const WARN = css.getPropertyValue('--warn').trim() || '#ff6f8f';
+
+  let W=0, H=0, DPR=1;
+  function resize(){
+    DPR = Math.min(2, devicePixelRatio || 1);
+    W = innerWidth; H = innerHeight;
+    c.width = Math.floor(W * DPR);
+    c.height = Math.floor(H * DPR);
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  addEventListener('resize', resize, { passive:true });
+  resize();
+
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp=(a,b,t)=>a+(b-a)*t;
+
+  // =======================
+  // Tuning (locked pocket)
+  // =======================
+  const LANE_W = 0.30;
+  const GRAV = 1500;
+  const OFF_CLAMP = 0.48;
+  const SNAP = 0.35;
+
+  const BASE_SPEED = 520;
+  const TILT_LIMIT = 0.55;
+  const COLLAPSE_GRACE_S = 0.12;
+
+  const BANK_KEY = 's';
+
+  const BW=()=>Math.min(78, W*0.12);
+  const BH=()=>Math.min(20, H*0.024);
+
+  const lane = {
+    cx: ()=> W*0.5,
+    w:  ()=> W*LANE_W,
+    left: ()=> W*0.5 - (W*LANE_W)/2,
+    right:()=> W*0.5 + (W*LANE_W)/2
+  };
+
+  // =======================
+  // Best scores (localStorage)
+  // =======================
+  const LS_KEY = 'stack_narrow_v1';
+  function loadBest(){
+    try{ return JSON.parse(localStorage.getItem(LS_KEY) || '{}'); }
+    catch{ return {}; }
+  }
+  function saveBest(obj){
+    try{ localStorage.setItem(LS_KEY, JSON.stringify(obj)); }catch{}
+  }
+  let best = loadBest();
+  best.bestRun = best.bestRun || 0;
+  best.bestBank = best.bestBank || 0;
+  best.bestHeight = best.bestHeight || 0;
+
+  // =======================
+  // Game state
+  // =======================
+  let bank=0, run=0;
+  let alive=true;
+
+  let msg="", msgT=0, msgColor=INK;
+
+  const tower = {
+    x: 0, xv: 0, angle: 0, av: 0, com: 0,
+    offsets: []
+  };
+
+  const fall = { active:true, x:0, y:0, vy:0 };
+
+  // Input
+  let leftHeld=false, rightHeld=false;
+  let mouseX=null;
+
+  // Fairness helpers
+  let lastExtreme=false;
+  let overTiltTime=0;
+
+  // Onboarding visibility
+  let started=false;
+  const SEEN_KEY = 'stack_seen_v1';
+  let seen = false;
+  try{ seen = localStorage.getItem(SEEN_KEY)==='1'; }catch{}
+  function showHelp(force){
+    const want = (force !== undefined) ? force : (ov.style.display==='none');
+    ov.style.display = want ? 'flex' : 'none';
+  }
+  if(!seen){
+    showHelp(true);
+  }
+
+  function pop(t, dur=0.9, color=INK){
+    msg=t; msgT=dur; msgColor=color;
+  }
+
+  function updateBest(){
+    const height = tower.offsets.length;
+    if(run > best.bestRun) best.bestRun = run;
+    if(bank > best.bestBank) best.bestBank = bank;
+    if(height > best.bestHeight) best.bestHeight = height;
+    saveBest(best);
+  }
+
+  function reset(all=false){
+    if(all) bank=0;
+    run=0; alive=true;
+    msg=""; msgT=0; msgColor=INK;
+
+    tower.x = lane.cx();
+    tower.xv = 0;
+    tower.angle = 0;
+    tower.av = 0;
+    tower.com = 0;
+    tower.offsets = [];
+
+    // reset helpers
+    lastExtreme=false;
+    overTiltTime=0;
+
+    // counterbalance
+    cbCooldown = 0;
+
+    spawn();
+  }
+
+  // =======================
+  // Spawn (anti-cheap)
+  // =======================
+  function spawn(){
+    const w=BW();
+    fall.active=true;
+    fall.y = H*0.10;
+    fall.vy = 0;
+
+    const r = Math.random();
+    const u = (Math.random()*2-1);
+    let bias = (r < 0.80) ? u*0.45 : u*0.90;
+
+    // Anti-cheap: soften consecutive extremes.
+    const extreme = Math.abs(bias) > 0.70;
+    if(lastExtreme && extreme) bias *= 0.55;
+    lastExtreme = extreme;
+
+    const range = (lane.w()/2 - w*0.60);
+    fall.x = lane.cx() + bias*range;
+  }
+
+  // =======================
+  // Bank
+  // =======================
+  function doBank(){
+    if(!alive || run<=0) return;
+    bank += run;
+    pop(`BANKED +${run}`, 0.9, NICE);
+
+    // Calm beat (reward feel)
+    tower.av *= 0.55;
+    tower.angle *= 0.85;
+
+    run = 0;
+    updateBest();
+    reset(false);
+  }
+
+  function collapse(){
+    alive=false;
+    fall.active=false;
+    run=0;
+    updateBest();
+    pop("COLLAPSE", 1.2, WARN);
+  }
+
+  // =======================
+  // Counterbalance Bonus (formal)
+  // =======================
+  const CB_MIN_HEIGHT = 5;
+  const CB_COOLDOWN_BLOCKS = 2;
+  const CB_MAG_SIM = 0.60;
+  const CB_NET_MAX = 0.20;
+  const CB_AV_DAMP = 0.84;
+  const CB_BASE_BONUS = 6;
+  const CB_HEIGHT_BONUS = 0.6;
+  let cbCooldown = 0;
+
+  function tryCounterbalance(){
+    if(cbCooldown > 0) return false;
+
+    const n = tower.offsets.length;
+    if(n < 2) return false;
+    if(n < CB_MIN_HEIGHT) return false;
+
+    const a = tower.offsets[n-2];
+    const b = tower.offsets[n-1];
+
+    if(Math.sign(a) === Math.sign(b)) return false;
+
+    const A = Math.abs(a), B = Math.abs(b);
+    const sim = Math.min(A,B) / Math.max(A,B);
+    if(sim < CB_MAG_SIM) return false;
+
+    const net = Math.abs(a + b);
+    if(net > CB_NET_MAX) return false;
+
+    // Reward: wobble calm + gentle COM relax (stronger when tall)
+    tower.av *= CB_AV_DAMP;
+    const comRelax = (n >= 9) ? 0.88 : 0.90;
+    tower.com *= comRelax;
+
+    const bonus = Math.round(CB_BASE_BONUS + n * CB_HEIGHT_BONUS);
+    run += bonus;
+
+    pop("COUNTER!", 0.55, COUNTER);
+    cbCooldown = CB_COOLDOWN_BLOCKS;
+    return true;
+  }
+
+  // =======================
+  // Landing / stacking
+  // =======================
+  function commitLanding(){
+    if(!alive || !fall.active) return;
+
+    const w=BW();
+    const dx = fall.x - tower.x;
+    let ndx = dx;
+
+    // SNAP: forgiving near center
+    if(Math.abs(dx) < w*0.22) ndx = dx*(1-SNAP);
+
+    // Clamp placement
+    const off = clamp(ndx / w, -OFF_CLAMP, OFF_CLAMP);
+
+    tower.offsets.push(off);
+    tower.com = lerp(tower.com, off, 0.16);
+
+    // Score: accuracy + height
+    const height = tower.offsets.length;
+    const q = clamp(1 - Math.abs(off)/OFF_CLAMP, 0, 1);
+    run += Math.round(10*(1 + height*0.12)*(0.55 + q));
+
+    // Disturbance: worse placement = more chaos
+    const chaos = (1-q);
+    tower.av += (Math.random()-0.5) * (0.020 + height*0.0006) * (0.35 + chaos*1.6);
+    tower.angle += (Math.random()-0.5) * (0.010 + chaos*0.020);
+
+    // Feedback (color-coded)
+    if(q > 0.93){
+      tower.av *= 0.84; tower.angle *= 0.92; tower.com *= 0.93;
+      pop("PERFECT", 0.55, GOOD);
+    } else if(q > 0.80){
+      pop("NICE", 0.45, NICE);
+    } else if(q > 0.72){
+      pop("CLOSE", 0.28, CLOSE);
+    }
+
+    // Counterbalance
+    cbCooldown = Math.max(0, cbCooldown - 1);
+    tryCounterbalance();
+
+    // Update bests after every landing (cheap and safe)
+    updateBest();
+
+    fall.active=false;
+    setTimeout(spawn, 70);
+  }
+
+  // =======================
+  // Input + onboarding start
+  // =======================
+  function markStarted(){
+    if(started) return;
+    started = true;
+    if(!seen){
+      try{ localStorage.setItem(SEEN_KEY,'1'); }catch{}
+      seen = true;
+    }
+    showHelp(false);
+  }
+
+  addEventListener('keydown', (e)=>{
+    markStarted();
+    const k = e.key.toLowerCase();
+
+    if(k === 'h'){
+      showHelp();
+      return;
+    }
+
+    if(k==='a' || e.key==='ArrowLeft') leftHeld=true;
+    if(k==='d' || e.key==='ArrowRight') rightHeld=true;
+
+    if(k===BANK_KEY) doBank();
+    if(k==='r') reset(true);
+
+    if(k===' ' || k==='enter'){
+      if(!alive){ reset(false); return; }
+      if(fall.active) commitLanding();
+    }
+  });
+
+  addEventListener('keyup', (e)=>{
+    const k = e.key.toLowerCase();
+    if(k==='a' || e.key==='ArrowLeft') leftHeld=false;
+    if(k==='d' || e.key==='ArrowRight') rightHeld=false;
+  });
+
+  addEventListener('mousemove', (e)=>{ mouseX = e.clientX; }, {passive:true});
+
+  c.addEventListener('pointerdown', ()=>{
+    markStarted();
+    if(!alive) reset(false);
+    else if(fall.active) commitLanding();
+  });
+
+  // =======================
+  // Loop
+  // =======================
+  let last = performance.now();
+  function tick(t){
+    const dt = Math.min(0.033, (t-last)/1000);
+    last = t;
+
+    if(msgT>0) msgT = Math.max(0, msgT - dt);
+
+    const w=BW(), h=BH();
+    const floorY = H*0.86;
+
+    // Base control
+    let ax = 0;
+    if(leftHeld) ax -= 1;
+    if(rightHeld) ax += 1;
+
+    if(mouseX !== null){
+      const target = clamp(mouseX, lane.left()+w*0.60, lane.right()-w*0.60);
+      tower.x = lerp(tower.x, target, 1 - Math.pow(0.0005, dt));
+      tower.xv *= 0.6;
+    } else {
+      tower.xv = ax * BASE_SPEED;
+      tower.x += tower.xv * dt;
+      tower.x = clamp(tower.x, lane.left()+w*0.60, lane.right()-w*0.60);
+    }
+
+    // Tower physics
+    if(alive){
+      const n = tower.offsets.length;
+      const restore = -tower.angle * (0.095/(1+n*0.13));
+      const torque  = tower.com * (0.22 + n*0.0045);
+      const gust    = (Math.random()-0.5) * (0.0032 + n*0.00025);
+
+      tower.av += (restore + torque + gust) * (dt*60);
+      tower.av *= 0.985;
+      tower.angle += tower.av * (dt*60);
+
+      // Collapse grace window (anti-cheap)
+      const over = Math.abs(tower.angle) > TILT_LIMIT;
+      if(over){
+        overTiltTime += dt;
+        if(overTiltTime > 0.05 && msgT <= 0.01) pop("HOLD!", 0.20, WARN);
+        if(overTiltTime >= COLLAPSE_GRACE_S) collapse();
+      } else {
+        overTiltTime = Math.max(0, overTiltTime - dt*3.0);
+      }
+    }
+
+    // Falling physics
+    if(alive && fall.active){
+      fall.vy += GRAV * dt;
+      fall.y  += fall.vy * dt;
+
+      const height = tower.offsets.length * (h+3);
+      const catchY = floorY - height - h - 6;
+
+      if(fall.y >= catchY){
+        fall.y = catchY;
+        commitLanding(); // auto-land
+      }
+    }
+
+    draw(w,h,floorY);
+    requestAnimationFrame(tick);
+  }
+
+  // =======================
+  // Draw (minimal color polish + risk readability)
+  // =======================
+  function blockFill(i, total){
+    // Subtle height-based tint (still “simple”).
+    // If you want pure monochrome: return INK;
+    const t = (total<=1)?0:(i/(total-1));
+    const hue = 205 + t*35;   // blue -> violet
+    const sat = 70;
+    const lit = 78;
+    return `hsl(${hue} ${sat}% ${lit}%)`;
+  }
+
+  function draw(w,h,floorY){
+    // Background gradient (subtle)
+    const g = ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0, css.getPropertyValue('--bg0').trim() || '#0b0f16');
+    g.addColorStop(1, css.getPropertyValue('--bg1').trim() || '#0e1116');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H);
+
+    const risk01 = clamp(Math.abs(tower.angle) / TILT_LIMIT, 0, 1);
+
+    // Lane fill
+    ctx.save();
+    ctx.globalAlpha=0.10;
+    ctx.fillStyle=INK;
+    ctx.fillRect(lane.left(), H*0.08, lane.w(), H*0.82);
+    ctx.restore();
+
+    // Lane borders (risk-reactive)
+    ctx.save();
+    ctx.globalAlpha = 0.18 + risk01*0.25;
+    ctx.strokeStyle = risk01>0.85 ? WARN : INK;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(lane.left(), H*0.08);  ctx.lineTo(lane.left(), floorY+14);
+    ctx.moveTo(lane.right(),H*0.08);  ctx.lineTo(lane.right(),floorY+14);
+    ctx.stroke();
+    ctx.restore();
+
+    // Floor
+    ctx.save();
+    ctx.globalAlpha=0.22;
+    ctx.strokeStyle=INK;
+    ctx.beginPath();
+    ctx.moveTo(lane.left(), floorY+10);
+    ctx.lineTo(lane.right(),floorY+10);
+    ctx.stroke();
+    ctx.restore();
+
+    // Tower
+    ctx.save();
+    ctx.translate(tower.x, floorY);
+    ctx.rotate(tower.angle);
+
+    const total = tower.offsets.length;
+    for(let i=0;i<total;i++){
+      const off = tower.offsets[i];
+      const x = off*w*0.85;
+      const y = -(i+1)*(h+3);
+
+      ctx.fillStyle = blockFill(i, total);
+      ctx.fillRect(-w/2 + x, y, w, h);
+
+      // tiny “scanline” shadow
+      ctx.globalAlpha=0.12;
+      ctx.fillStyle="#000";
+      ctx.fillRect(-w/2 + x, y + h*0.72, w, 1);
+      ctx.globalAlpha=1;
+    }
+    ctx.restore();
+
+    // Base indicator (risk-reactive)
+    if(alive){
+      ctx.save();
+      ctx.globalAlpha = 0.18 + risk01*0.18;
+      ctx.fillStyle = INK;
+      ctx.fillRect(tower.x-60, floorY+14, 120, 4);
+      ctx.globalAlpha = 0.45 + risk01*0.12;
+      ctx.fillRect(tower.x-12, floorY+10, 24, 12);
+      ctx.restore();
+    }
+
+    // Falling block
+    if(fall.active){
+      ctx.save();
+      ctx.globalAlpha=0.92;
+      ctx.fillStyle = INK;
+      ctx.fillRect(fall.x-w/2, fall.y, w, h);
+      ctx.restore();
+    }
+
+    // Message (small pop/zoom)
+    if(msgT>0){
+      const s = 1 + (Math.min(1, msgT/0.2))*0.06;
+      ctx.save();
+      ctx.translate(W*0.5, H*0.18);
+      ctx.scale(s,s);
+      ctx.globalAlpha = Math.min(1, msgT/0.2);
+      ctx.fillStyle = msgColor;
+      ctx.font="800 22px system-ui";
+      ctx.textAlign="center";
+      ctx.textBaseline="middle";
+      ctx.fillText(msg, 0, 0);
+      ctx.restore();
+    }
+
+    // HUD text
+    const riskPct = Math.round(risk01*100);
+    const gracePct = Math.round(clamp(overTiltTime / COLLAPSE_GRACE_S, 0, 1)*100);
+    hudL.textContent = `RUN: ${run} · BANK: ${bank} · risk:${riskPct}% · grace:${gracePct}%`;
+    hudR.textContent = `BEST RUN: ${best.bestRun} · BEST BANK: ${best.bestBank} · BEST HEIGHT: ${best.bestHeight}`;
+  }
+
+  reset(true);
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
